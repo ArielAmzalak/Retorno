@@ -1,13 +1,12 @@
 # ────────────────────────────────────────────────────────────────────────────────
-# app.py – Selecionar amostras no Google Sheets, marcar “Retorno 1241”,
-# informar Ordem de Serviço (coluna AH) e baixar Excel
-# Execute com:  streamlit run app.py
+# app.py – Selecionar amostras, atribuir OS individual, marcar “Retorno 1241”
+# e baixar Excel
 # ────────────────────────────────────────────────────────────────────────────────
 from __future__ import annotations
 
 import io, os, json
 from datetime import datetime
-from typing import List
+from typing import List, Dict
 
 import pandas as pd
 import streamlit as st
@@ -17,7 +16,7 @@ from googleapiclient.errors import HttpError
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-# ╭────────────────────────── CONFIGURAÇÕES ───────────────────────────╮
+# ╭──────────────────────── CONFIGURAÇÕES GERAIS ────────────────────────╮
 SCOPES         = ["https://www.googleapis.com/auth/spreadsheets"]
 SPREADSHEET_ID = "1VLDQUCO3Aw4ClAvhjkUsnBxG44BTjz-MjHK04OqPxYM"
 SHEET_NAME     = "Geral"
@@ -28,9 +27,10 @@ OS_COL     = "AH"                     # Ordem de Serviço
 
 STATUS_VAL = "Retorno 1241"
 DATE_FMT   = "%d/%m/%Y"
-# ╰────────────────────────────────────────────────────────────────────╯
+# ╰──────────────────────────────────────────────────────────────────────╯
 
-# ─────────────────────── Google Sheets helpers ───────────────────────
+
+# ─────────────────────────── Google helpers ────────────────────────────
 @st.cache_resource
 def _authorize_google() -> Credentials:
     token_path = "token.json"
@@ -41,12 +41,8 @@ def _authorize_google() -> Credentials:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            try:
-                client_config = json.loads(st.secrets["GOOGLE_CLIENT_SECRET"])
-            except Exception:
-                st.error("❌ Credenciais do Google não encontradas.")
-                st.stop()
-            flow  = InstalledAppFlow.from_client_config(client_config, SCOPES)
+            client_config = json.loads(st.secrets["GOOGLE_CLIENT_SECRET"])
+            flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
             creds = flow.run_console()
         with open(token_path, "w", encoding="utf-8") as fp:
             fp.write(creds.to_json())
@@ -59,7 +55,6 @@ def _get_service():
 
 
 def _col_to_index(col: str) -> int:
-    """Converte 'A' → 0, 'B' → 1, …"""
     idx = 0
     for c in col:
         idx = idx * 26 + (ord(c.upper()) - 64)
@@ -67,7 +62,6 @@ def _col_to_index(col: str) -> int:
 
 
 def fetch_sheet() -> List[List[str]]:
-    """Lê a aba inteira como texto."""
     res = (
         _get_service()
         .spreadsheets()
@@ -82,73 +76,95 @@ def fetch_sheet() -> List[List[str]]:
     return res.get("values", [])
 
 
-def update_rows(rows_idx: List[int], today: str, os_val: str) -> None:
-    """Atualiza Status, Data e Ordem de Serviço nas linhas indicadas (1-based)."""
-    svc = _get_service()
+def update_rows(rows_idx: List[int], today: str, os_vals: List[str]) -> None:
+    """
+    Atualiza cada linha (mesmo não contígua) com:
+      • STATUS_COL  = STATUS_VAL
+      • DATE_COL    = today
+      • OS_COL      = os_vals[i]
+    """
+    svc  = _get_service()
+    data = []
 
-    ranges = {
-        STATUS_COL: {"values": [[STATUS_VAL]] * len(rows_idx)},
-        DATE_COL  : {"values": [[today]]       * len(rows_idx)},
-        OS_COL    : {"values": [[os_val]]      * len(rows_idx)},
-    }
+    for idx, os_val in zip(rows_idx, os_vals):
+        data.extend([
+            {"range": f"{SHEET_NAME}!{STATUS_COL}{idx}", "values": [[STATUS_VAL]]},
+            {"range": f"{SHEET_NAME}!{DATE_COL}{idx}",   "values": [[today]]},
+            {"range": f"{SHEET_NAME}!{OS_COL}{idx}",     "values": [[os_val]]},
+        ])
 
     try:
-        for col, body in ranges.items():
-            rng = f"{SHEET_NAME}!{col}{rows_idx[0]}:{col}{rows_idx[-1]}"
-            svc.spreadsheets().values().update(
-                spreadsheetId=SPREADSHEET_ID,
-                range=rng,
-                valueInputOption="RAW",
-                body=body,
-            ).execute()
+        svc.spreadsheets().values().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID,
+            body={"valueInputOption": "RAW", "data": data},
+        ).execute()
     except HttpError:
         st.error("❌ Falha ao atualizar dados no Google Sheets.")
         st.stop()
+
 
 # ───────────────────────────── UI Streamlit ────────────────────────────
 st.set_page_config(page_title="Selecionar Amostras", page_icon="🛢️", layout="centered")
 st.title("Selecionar Amostras 🛢️")
 
-if "samples" not in st.session_state:
-    st.session_state["samples"] = []
-if "current_input" not in st.session_state:
-    st.session_state["current_input"] = ""
-if "order_service" not in st.session_state:
-    st.session_state["order_service"] = ""
+# ----- estado -----
+if "samples"    not in st.session_state: st.session_state["samples"] = []      # lista de códigos
+if "sample_os"  not in st.session_state: st.session_state["sample_os"] = {}    # dict código ➜ OS
+if "current_in" not in st.session_state: st.session_state["current_in"] = ""
+
 
 def _add_sample():
-    code = st.session_state["current_input"].strip()
+    code = st.session_state["current_in"].strip()
     if code and code not in st.session_state["samples"]:
         st.session_state["samples"].append(code)
-    st.session_state["current_input"] = ""   # limpa campo após Enter
+        st.session_state["sample_os"][code] = ""       # OS em branco
+    st.session_state["current_in"] = ""                # limpa input
+
 
 st.text_input(
     "📷 Escaneie o código de barras e pressione Enter",
-    key="current_input",
+    key="current_in",
     on_change=_add_sample,
 )
 
-# NOVO: campo Ordem de Serviço
-st.text_input(
-    "🔧 Ordem de Serviço (para todas as amostras selecionadas)",
-    key="order_service",
-)
+# ----- editor de OS -----
+if st.session_state["samples"]:
+    df_display = pd.DataFrame(
+        [{"Amostra": s, "OS": st.session_state["sample_os"][s]}
+         for s in st.session_state["samples"]]
+    )
+    edited_df = st.data_editor(
+        df_display,
+        column_config={"Amostra": st.column_config.TextColumn(read_only=True)},
+        num_rows="dynamic",
+        use_container_width=True,
+        key="data_editor",
+    )
 
-st.write("### Amostras pré-selecionadas")
-st.write(", ".join(st.session_state["samples"]) or "Nenhuma.")
+    # salva mudanças no estado
+    for _, row in edited_df.iterrows():
+        st.session_state["sample_os"][row["Amostra"]] = str(row["OS"]).strip()
 
+else:
+    st.write("### Nenhuma amostra adicionada.")
+
+# ----- botões -----
 col1, col2 = st.columns(2)
 with col1:
     if st.button("🗑️ Limpar lista"):
         st.session_state["samples"].clear()
+        st.session_state["sample_os"].clear()
 with col2:
     gerar = st.button("📥 Gerar planilha")
 
+
 # ────────────────── Seleção, atualização e exportação ──────────────────
 if gerar and st.session_state["samples"]:
-    os_val = st.session_state["order_service"].strip()
-    if not os_val:
-        st.warning("Informe a Ordem de Serviço antes de gerar a planilha.")
+    # Verifica se todas as OS foram preenchidas
+    os_vazias = [s for s in st.session_state["samples"]
+                 if not st.session_state["sample_os"][s]]
+    if os_vazias:
+        st.warning(f"Preencha a OS das amostras em branco: {', '.join(os_vazias)}.")
         st.stop()
 
     with st.spinner("Consultando Google Sheets…"):
@@ -158,17 +174,18 @@ if gerar and st.session_state["samples"]:
             st.stop()
 
         header, *data = sheet_rows
-        g_idx   = _col_to_index("G")
-        os_idx  = _col_to_index(OS_COL)
+        g_idx  = _col_to_index("G")
+        os_idx = _col_to_index(OS_COL)
 
-        selected_rows, lines_idx = [], []
-        samples_set = {s.strip() for s in st.session_state["samples"]}
+        selected_rows, lines_idx, os_vals = [], [], []
+        samples_set = set(st.session_state["samples"])
 
-        for i, row in enumerate(data, start=2):          # 1-based (linha 1 = header)
+        for i, row in enumerate(data, start=2):              # 1-based
             sample_text = str(row[g_idx]).strip() if g_idx < len(row) else ""
             if sample_text in samples_set:
                 selected_rows.append(row)
                 lines_idx.append(i)
+                os_vals.append(st.session_state["sample_os"][sample_text])
 
         if not selected_rows:
             st.warning("Nenhuma amostra encontrada na planilha.")
@@ -176,17 +193,17 @@ if gerar and st.session_state["samples"]:
 
     today = datetime.now().strftime(DATE_FMT)
     with st.spinner("Atualizando Google Sheets…"):
-        update_rows(lines_idx, today, os_val)
+        update_rows(lines_idx, today, os_vals)
 
     with st.spinner("Gerando arquivo Excel…"):
-        # Normaliza tamanho das linhas e insere OS
+        # Garante tamanho da linha e injeta OS respectiva
         norm_rows = []
-        for r in selected_rows:
-            r += [""] * (len(header) - len(r))           # completa células vazias
-            r[os_idx] = os_val                           # preenche coluna AH
-            norm_rows.append(r)
+        for row, os_val in zip(selected_rows, os_vals):
+            row += [""] * (len(header) - len(row))
+            row[os_idx] = os_val
+            norm_rows.append(row)
 
-        df  = pd.DataFrame(norm_rows, columns=header)
+        df = pd.DataFrame(norm_rows, columns=header)
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="xlsxwriter") as xw:
             df.to_excel(xw, index=False, sheet_name="Amostras")
