@@ -125,11 +125,22 @@ with c3: st.button("➕ Adicionar", on_click=add_item)
 
 if st.session_state.msg: st.warning(st.session_state.msg)
 
-# ---------- tabela resumo ----------
+# ---------- tabela resumo (com botão de remoção por linha) ----------
 if st.session_state.lista:
-    st.dataframe(pd.DataFrame(
-        [{"Amostra": c, "OS": o} for c, o in st.session_state.lista.items()]
-    ), hide_index=True)
+    st.subheader("Lista de amostras")
+    h1, h2, h3 = st.columns([3, 3, 1])
+    h1.markdown("**Amostra**")
+    h2.markdown("**OS**")
+    h3.markdown("**Ações**")
+
+    for cod, osv in list(st.session_state.lista.items()):
+        c1, c2, c3 = st.columns([3, 3, 1])
+        c1.code(cod)
+        c2.write(osv)
+        if c3.button("🗑️ Remover", key=f"rm_{cod}"):
+            st.session_state.lista.pop(cod, None)
+            st.session_state.msg = f"Amostra {cod} removida."
+            st.rerun()
 else:
     st.info("Nenhuma amostra adicionada.")
 
@@ -142,13 +153,13 @@ with col1:
 with col2:
     gerar = st.button("📥 Gerar planilha")
 
-# ──────────────────── Seleção, gravação e exportação ───────────────────
+# ──────────────────── Seleção, checagem, gravação e exportação ───────────────────
 if gerar:
     if not st.session_state.lista:
         st.error("📋 A lista está vazia.")
         st.stop()
 
-    # 1. Localiza as amostras na planilha
+    # 1) Localiza as amostras na planilha
     with st.spinner("Consultando planilha…"):
         sheet = fetch_sheet()
         if not sheet: st.error("Aba vazia."); st.stop()
@@ -157,23 +168,36 @@ if gerar:
         sample_idx, os_idx = _col_to_idx(SAMPLE_COL), _col_to_idx(OS_COL)
 
         rows_idx, os_vals, rows_data = [], [], []
+        encontrados = set()
+
         for i, row in enumerate(data, start=2):
             code = str(row[sample_idx]).strip() if sample_idx < len(row) else ""
             if code in st.session_state.lista:
                 rows_idx.append(i)
                 os_vals.append(st.session_state.lista[code])
                 rows_data.append(row)
+                encontrados.add(code)
+
+        # 1b) Checagem de não encontrados
+        todos_digitados = list(st.session_state.lista.keys())
+        nao_encontrados = [c for c in todos_digitados if c not in encontrados]
+
+        if nao_encontrados:
+            st.warning(
+                "⚠️ As seguintes amostras **não foram localizadas** na planilha e, portanto, **não serão atualizadas**:\n\n"
+                + "\n".join(f"- `{c}`" for c in nao_encontrados)
+            )
 
         if not rows_idx:
-            st.warning("Nenhuma das amostras digitadas está na planilha.")
+            # Nenhuma encontrada, encerra
             st.stop()
 
-    # 2. Atualiza AF / AG / AH
+    # 2) Atualiza AF / AG / AH apenas para as encontradas
     today = datetime.now().strftime(DATE_FMT)
     with st.spinner("Gravando no Google Sheets…"):
         update_rows(rows_idx, today, os_vals)
 
-    # 3. Prepara DataFrame já com STATUS & DATA
+    # 3) Prepara DataFrame já com STATUS & DATA (encontradas)
     status_idx, date_idx = _col_to_idx(STATUS_COL), _col_to_idx(DATE_COL)
     norm_rows = []
     for row, os_val in zip(rows_data, os_vals):
@@ -183,16 +207,28 @@ if gerar:
         row[os_idx]     = os_val
         norm_rows.append(row)
 
-    df = pd.DataFrame(norm_rows, columns=header)
+    df_ok = pd.DataFrame(norm_rows, columns=header)
 
-    # 4. Exporta Excel
+    # 4) Exporta Excel: aba "Amostras" (ok) + "Nao_Encontradas" (se houver)
     with st.spinner("Gerando Excel…"):
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="xlsxwriter") as xw:
-            df.to_excel(xw, index=False, sheet_name="Amostras")
+            df_ok.to_excel(xw, index=False, sheet_name="Amostras")
+
+            if nao_encontrados:
+                df_missing = pd.DataFrame(
+                    [{"Amostra": c, "OS informada": st.session_state.lista[c]} for c in nao_encontrados]
+                )
+                df_missing.to_excel(xw, index=False, sheet_name="Nao_Encontradas")
+
         buf.seek(0)
 
-    st.success(f"✔️ {len(df)} amostra(s) atualizada(s) e exportada(s).")
+    # 5) Mensagem final com resumo
+    msg = f"✔️ {len(df_ok)} amostra(s) atualizada(s) e exportada(s)."
+    if nao_encontrados:
+        msg += f" ❗ {len(nao_encontrados)} amostra(s) não encontrada(s) (veja aba 'Nao_Encontradas' no Excel)."
+    st.success(msg)
+
     st.download_button(
         "⬇️ Baixar Excel",
         data=buf,
